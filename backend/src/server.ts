@@ -1,0 +1,25 @@
+import "dotenv/config";
+import express from "express";
+import cors from "cors";
+import bcrypt from "bcryptjs";
+import jwt from "jsonwebtoken";
+import { PrismaClient } from "@prisma/client";
+import { z } from "zod";
+const app=express(); const prisma=new PrismaClient();
+const PORT=Number(process.env.PORT||4000), SECRET=process.env.JWT_SECRET||"development-secret", ML=process.env.ML_SERVICE_URL||"http://localhost:8000";
+app.use(cors({origin:process.env.CLIENT_URL||"http://localhost:5173"})); app.use(express.json({limit:"1mb"}));
+type Req=express.Request & {userId?:string};
+function token(id:string){return jwt.sign({userId:id},SECRET,{expiresIn:"7d"});}
+function auth(req:Req,res:express.Response,next:express.NextFunction){const h=req.headers.authorization;if(!h?.startsWith("Bearer "))return res.status(401).json({message:"Authentication required."});try{req.userId=(jwt.verify(h.slice(7),SECRET) as {userId:string}).userId;next();}catch{return res.status(401).json({message:"Invalid or expired token."});}}
+const register=z.object({name:z.string().min(2).max(80),email:z.string().email(),password:z.string().min(8).max(100)});
+const login=z.object({email:z.string().email(),password:z.string().min(8).max(100)});
+app.get("/api/health",(_q,r)=>r.json({status:"ok",service:"insightflow-backend"}));
+app.post("/api/auth/register",async(req,res)=>{const p=register.safeParse(req.body);if(!p.success)return res.status(400).json({message:"Invalid registration data."});const {name,email,password}=p.data;const normalized=email.toLowerCase();if(await prisma.user.findUnique({where:{email:normalized}}))return res.status(409).json({message:"An account with that email already exists."});const u=await prisma.user.create({data:{name,email:normalized,passwordHash:await bcrypt.hash(password,12)}});res.status(201).json({token:token(u.id),user:{id:u.id,name:u.name,email:u.email}});});
+app.post("/api/auth/login",async(req,res)=>{const p=login.safeParse(req.body);if(!p.success)return res.status(400).json({message:"Invalid login data."});const u=await prisma.user.findUnique({where:{email:p.data.email.toLowerCase()}});if(!u||!(await bcrypt.compare(p.data.password,u.passwordHash)))return res.status(401).json({message:"Email or password is incorrect."});res.json({token:token(u.id),user:{id:u.id,name:u.name,email:u.email}});});
+app.get("/api/me",auth,async(req:Req,res)=>res.json({user:await prisma.user.findUnique({where:{id:req.userId!},select:{id:true,name:true,email:true}})}));
+app.post("/api/analyses",auth,async(req:Req,res)=>{const p=z.object({title:z.string().max(120).optional(),text:z.string().min(20).max(10000)}).safeParse(req.body);if(!p.success)return res.status(400).json({message:"Text must contain between 20 and 10,000 characters."});try{const r=await fetch(`${ML}/analyze`,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({text:p.data.text})});if(!r.ok)throw new Error();const result=await r.json() as {sentiment:string;confidence:number;topics:string[];summary:string};const a=await prisma.analysis.create({data:{title:p.data.title?.trim()||"Untitled analysis",text:p.data.text,sentiment:result.sentiment,confidence:result.confidence,topics:result.topics,summary:result.summary,userId:req.userId!}});res.status(201).json({analysis:a});}catch{res.status(503).json({message:"The ML service is unavailable. Start the Python service and try again."});}});
+app.get("/api/analyses",auth,async(req:Req,res)=>res.json({analyses:await prisma.analysis.findMany({where:{userId:req.userId!},orderBy:{createdAt:"desc"}})}));
+app.delete("/api/analyses/:id",auth,async(req:Req,res)=>{const a=await prisma.analysis.findFirst({where:{id:req.params.id,userId:req.userId!}});if(!a)return res.status(404).json({message:"Analysis not found."});await prisma.analysis.delete({where:{id:a.id}});res.status(204).send();});
+app.get("/api/dashboard",auth,async(req:Req,res)=>{const [total,positive,negative,neutral,recent]=await Promise.all([prisma.analysis.count({where:{userId:req.userId!}}),prisma.analysis.count({where:{userId:req.userId!,sentiment:"positive"}}),prisma.analysis.count({where:{userId:req.userId!,sentiment:"negative"}}),prisma.analysis.count({where:{userId:req.userId!,sentiment:"neutral"}}),prisma.analysis.findMany({where:{userId:req.userId!},orderBy:{createdAt:"desc"},take:6})]);res.json({totalAnalyses:total,positiveAnalyses:positive,negativeAnalyses:negative,neutralAnalyses:neutral,recent});});
+app.get("/api/recommendations",auth,async(req:Req,res)=>{const a=await prisma.analysis.findMany({where:{userId:req.userId!},orderBy:{createdAt:"desc"},take:10});if(!a.length)return res.json({recommendations:[]});try{const r=await fetch(`${ML}/recommend`,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({text:a.map(x=>x.text).join("\n").slice(0,8000)})});if(!r.ok)throw new Error();res.json(await r.json());}catch{res.status(503).json({message:"Recommendation service unavailable."});}});
+app.listen(PORT,()=>console.log(`InsightFlow backend running on http://localhost:${PORT}`));
